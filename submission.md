@@ -23,7 +23,7 @@
 ### Data flow: adding a song to a playlist
 
 1. **Request:** `POST /playlists/<playlist_id>/songs` with `{ song_id, added_by }`.
-2. **Route (`routes/playlists.py::add_song`):** validates both fields are present, then calls `add_to_playlist(playlist_id, song_id, added_by)`, which comes from `services.notification_service`, not `services.playlist_service`.
+2. **Route (`routes/playlists.py::add_song`):** validates both fields are present, then calls `add_to_playlist(playlist_id, song_id, added_by)` — imported from `services.notification_service`, not `services.playlist_service`, despite the route file's name.
 3. **Service (`notification_service.add_to_playlist`):**
    - Loads `Song`, `User` (adder), `Playlist` — 404/400 via `ValueError` if any is missing.
    - If the song isn't already in `playlist.songs`, appends it via the ORM relationship (`playlist.songs.append(song)`) and commits. This writes a row into the `playlist_entries` association table.
@@ -69,6 +69,30 @@ Isolated `update_listening_streak()` in a Flask shell rather than going through 
 The two cases are identical in every respect (same starting streak, same one-day gap) except which day of the week the second listen fell on. This isolates the failure to the specific case where the new listening event occurs on a Sunday, ruling out a broader problem with the day-gap/increment logic itself.
 
 *(Root cause, fix, and side-effect verification to be completed in Milestone 3.)*
+
+### Issue #2: Friends Listening Now shows people from yesterday
+
+**How I reproduced it:**
+
+Started by testing the existing seed data directly (`get_friends_listening_now` for nova and for kenji) — both returned correct results, with no stale friends appearing. This ruled out the codebase's default state as a way to see the bug, so I moved to isolating the underlying mechanisms one at a time using a standalone script (`debug_repro.py`, run with `python debug_repro.py` inside an `app.app_context()`), rather than relying on the seed data alone:
+
+1. **Checked whether SQLite strips timezone info on read.** Queried a real `ListeningEvent` row directly and found `listened_at.tzinfo` returns `None` after being read back from the DB, even though it's written as timezone-aware (`datetime.now(timezone.utc)`). This looked like a plausible cause at first.
+2. **Verified whether that round-trip actually breaks the SQL filter.** Compiled the literal SQL `get_friends_listening_now` generates (via `query.statement.compile(..., compile_kwargs={"literal_binds": True})`) and compared the cutoff literal against raw stored strings pulled directly via `sqlite3`. Both were in the identical format (no timezone offset on either side), so the comparison is internally consistent — this ruled out the timezone round-trip as the cause.
+3. **Checked the `friendships` table directly** via raw SQL — found exactly 10 rows, matching `seed_data.py`'s 5 bidirectional `add_friendship()` calls, no duplicates or missing pairs. Ruled out.
+4. **Reviewed `routes/feed.py`** — confirmed it's a clean pass-through with no transformation between the service return value and the JSON response. Ruled out.
+5. **Manufactured a targeted data point:** inserted a `ListeningEvent` for `aaliya` (kenji's only friend with no other competing recent event) at exactly 19 hours before "now," then called `get_friends_listening_now(kenji.id)`. Result: **aaliya appeared in kenji's feed** with the 19-hour-old timestamp.
+
+This confirms the bug is reproducible, but only when a friend's most recent event falls somewhere between roughly "more than a few hours old" and the 24-hour cutoff — the existing seed data didn't happen to contain a case in that exact window, which is why the bug wasn't visible without manufacturing one.
+
+**How I found the root cause:**
+
+Compared `get_friends_listening_now()` against its sibling function `get_activity_feed()` in the same file. `get_activity_feed`'s own docstring explicitly states it is the *unfiltered, historical* feed ("this is not filtered by recency"), implying by contrast that `get_friends_listening_now` was intended to represent a much narrower, genuinely live window — not a full calendar day.
+
+**The root cause:**
+
+`get_friends_listening_now()` filters events using `RECENT_THRESHOLD = timedelta(hours=24)`. The filter and its underlying SQL comparison work exactly as coded (verified: the compiled cutoff literal matched the stored timestamp format exactly, ruling out a timezone/string-comparison defect). The actual problem is the threshold value itself: 24 hours is too generous for a feature presented to users as "Listening Now." A friend who listened at, e.g., 10pm the previous night will still appear as "currently listening" for the entire next day, which matches the reported symptom ("shows people from yesterday"). This is a threshold/design defect rather than a broken comparison or missing condition.
+
+*(Fix and side-effect verification to be completed in Milestone 3.)*
 
 ### Patterns observed
 

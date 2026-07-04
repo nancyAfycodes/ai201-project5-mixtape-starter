@@ -26,15 +26,15 @@
 2. **Route (`routes/playlists.py::add_song`):** validates both fields are present, then calls `add_to_playlist(playlist_id, song_id, added_by)`, which comes from `services.notification_service`, not `services.playlist_service`.
 3. **Service (`notification_service.add_to_playlist`):**
    - Loads `Song`, `User` (adder), `Playlist` — 404/400 via `ValueError` if any is missing.
-   - If the song isn't already in `playlist.songs`, adds it playlist (`playlist.songs.append(song)`) and commits,which then writes a row into the `playlist_entries` association table.
-   - If the added song isn't the song's original sharer (`song.shared_by`), calls `create_notification(...)` to notify the sharer.
+   - If the song isn't already in `playlist.songs`, appends it via the ORM relationship (`playlist.songs.append(song)`) and commits. This writes a row into the `playlist_entries` association table.
+   - If the adder is not the song's original sharer (`song.shared_by`), calls `create_notification(...)` to notify the sharer.
 4. **Read-back (separate request):** `GET /playlists/<playlist_id>/songs` → `routes/playlists.py::get_songs` → `playlist_service.get_playlist_songs`, which queries the **raw `playlist_entries` table** directly (not the ORM relationship), joined to `Song`, ordered by `position` ascending.
 
-**Notable pattern:** the write and read path read from the same association table (`playlist_entries`) through two different access methods — ORM relationship append vs. raw table join/query. The write path never explicitly sets `position`; how that column ends up populated is worth tracing carefully.
+**Notable pattern:** the write path and read path touch the same association table (`playlist_entries`) through two different access methods — ORM relationship append vs. raw table join/query. The write path never explicitly sets `position`; how that column ends up populated is worth tracing carefully.
 
 ### Data flow: a friend's listen appearing in "Friends Listening Now"
 
-1. **Record:** `POST /songs/<song_id>/listen` with `{ user_id }` → `routes/songs.py::listen` → `streak_service.record_listening_event`, which creates a `ListeningEvent(listened_at=now)` and also updates the listener's streak in the same call. 
+1. **Record:** `POST /songs/<song_id>/listen` with `{ user_id }` → `routes/songs.py::listen` → `streak_service.record_listening_event`, which creates a `ListeningEvent(listened_at=now)` and also updates the listener's streak in the same call (one action, two side effects).
 2. **View:** `GET /feed/<user_id>/listening-now` → `routes/feed.py::listening_now` → `feed_service.get_friends_listening_now`, which:
    - Resolves `friend_ids` from `user.friends` (confirmed bidirectional in `seed_data.py`).
    - Filters `ListeningEvent` to `user_id IN friend_ids AND listened_at >= (now - 24h)`.
@@ -44,16 +44,31 @@
 ### Data flow: a user rates a song
 
 1. **Request:** `POST /songs/<song_id>/rate` with `{ user_id, score }`.
-2. **Route (`routes/songs.py::rate`):** validates both fields are present, casts `score` to `int`, then calls `rate_song(user_id, song_id, score)` that is imported from `services.notification_service`, the same file that holds `add_to_playlist`.
+2. **Route (`routes/songs.py::rate`):** validates both fields are present, casts `score` to `int`, then calls `rate_song(user_id, song_id, score)` — imported from `services.notification_service`, the same file that hosts `add_to_playlist`.
 3. **Service (`notification_service.rate_song`):**
    - Validates `score` is between 1 and 5.
-   - Loads `Song` and `User` (rater); raises `ValueError` if either is missing.
+   - Loads `Song` and `User` (rater) — raises `ValueError` if either is missing.
    - Looks up an existing `Rating` for this `(user_id, song_id)` pair (enforced unique by `models.py`'s `UniqueConstraint`).
    - If found, updates its `score` in place; if not, creates a new `Rating` row.
    - Commits and returns the `Rating`.
-4. **Notification: does not happen.** Unlike the function `add_to_playlist` in the same file, which calls `create_notification(...)` after changing the playlist, `rate_song` never calls `create_notification` anywhere in its body. The `Rating` itself is persisted correctly and readable via other endpoints, but no `Notification` row is ever created as a result of a rating.
+4. **Notification: does not happen.** Unlike its sibling function `add_to_playlist` in the same file — which calls `create_notification(...)` after mutating the playlist — `rate_song` never calls `create_notification` anywhere in its body. The `Rating` itself is persisted correctly and readable via other endpoints, but no `Notification` row is ever created as a result of a rating.
 
-**Comparison to the playlist-add flow:** both functions follow the same shape (load entities → mutate/persist → [conditionally] notify), but only `add_to_playlist` completes the third step. This directly explains reported issue #4 ("notified when a friend added my song to a playlist but not when they rated it"). The rating path isn't calling the playlist-add path. See root cause analysis section for full write-up once fixed.
+**Comparison to the playlist-add flow:** both functions follow the same shape (load entities → mutate/persist → [conditionally] notify), but only `add_to_playlist` completes the third step. This directly explains reported issue #4 ("notified when a friend added my song to a playlist but not when they rated it") — the rating path is simply missing the call that the playlist-add path has. See root cause analysis section for full write-up once fixed.
+
+## Root Cause Analysis
+
+### Issue #1: My listening streak keeps resetting
+
+**How I reproduced it:**
+
+Isolated `update_listening_streak()` in a Flask shell rather than going through HTTP, to get precise control over the `now` value passed in.
+
+- **Case A (bug):** Set a `User` with `listening_streak = 5` and `last_listened_at` = Saturday, June 27, 2026 (UTC). Called `update_listening_streak(user, sunday)` with `sunday` = June 28, 2026 (UTC) — exactly one consecutive calendar day later. Expected the streak to increment to 6 per the documented rules ("If the user listened yesterday: streak increments by 1"). Instead, the streak dropped to 1. Confirmed `sunday.weekday() == 6`.
+- **Case B (control):** Repeated the identical setup but with `last_listened_at` = Monday, June 29, 2026 and the new listen on Tuesday, June 30, 2026 — also exactly one consecutive day apart. This time the streak correctly incremented from 5 to 6. Confirmed `tuesday.weekday() == 1`.
+
+The two cases are identical in every respect (same starting streak, same one-day gap) except which day of the week the second listen fell on. This isolates the failure to the specific case where the new listening event occurs on a Sunday, ruling out a broader problem with the day-gap/increment logic itself.
+
+*(Root cause, fix, and side-effect verification to be completed in Milestone 3.)*
 
 ### Patterns observed
 

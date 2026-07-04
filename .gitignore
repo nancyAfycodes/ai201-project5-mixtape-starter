@@ -29,3 +29,6 @@ build/
 # Editor
 .vscode/
 .idea/
+
+# debugging file
+.debug_repro.py

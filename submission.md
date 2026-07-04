@@ -1,0 +1,64 @@
+# Mixtape — Submission
+
+## Codebase Map
+
+### Main files and their roles
+
+| File | Role |
+|---|---|
+| `app.py` | Flask application factory. Configures the DB URI (SQLite by default via `DATABASE_URL` env var), registers all four blueprints (`songs`, `playlists`, `users`, `feed`), and creates tables on startup. |
+| `models.py` | SQLAlchemy models: `User`, `Song`, `Tag`, `ListeningEvent`, `Rating`, `Playlist`, `Notification`, plus three association tables (`friendships`, `song_tags`, `playlist_entries`). `playlist_entries` carries extra columns (`position`, `added_by`, `added_at`) beyond a plain many-to-many link. |
+| `routes/songs.py` | Search, song detail, rating, and listening-event endpoints. Delegates to `search_service`, `notification_service` (for rating), and `streak_service` (for listen events). No route here creates a `Song` — song creation isn't exposed via any route in this repo; songs only exist via `seed_data.py`. |
+| `routes/playlists.py` | Create playlist, get playlist metadata, get playlist songs, add song to playlist. The "add song" route delegates to `notification_service.add_to_playlist`, not `playlist_service` — the mutation logic lives in a different file than the name would suggest. |
+| `routes/users.py` | User lookup, streak lookup, notification list/mark-read. Delegates to `streak_service` and `notification_service`. |
+| `routes/feed.py` | "Listening now" and general activity feed endpoints. Delegates to `feed_service`. |
+| `services/streak_service.py` | Records listening events and updates `User.listening_streak` / `last_listened_at` based on calendar-day comparisons. |
+| `services/feed_service.py` | Builds the "friends listening now" (24h window, deduped per friend) and general activity feed (no time filter, capped by `limit`) from `ListeningEvent` rows filtered to `user.friends`. |
+| `services/search_service.py` | Text search over `Song.title` / `Song.artist`, outer-joined to `song_tags`. |
+| `services/notification_service.py` | Notification CRUD (`create_notification`, `get_notifications`, `mark_as_read`) **and** two domain actions that happen to live here: `add_to_playlist` (mutates `playlist.songs`, then conditionally notifies the original sharer) and `rate_song` (create-or-update a `Rating`, no notification triggered). |
+| `services/playlist_service.py` | Playlist creation and read-only retrieval: `get_playlist`, `get_user_playlists` (creator-only, not collaborators), and `get_playlist_songs` (joins the raw `playlist_entries` table, ordered by `position`). |
+| `seed_data.py` | Populates the DB with 5 users (bidirectional friendships), 25 songs (with 0, 1, or 3+ tags — multi-tag songs are explicitly noted in the script as exercising Issue #3), 3 playlists, a mix of recent and older `ListeningEvent` rows, preset streak values, and one example "song added to playlist" notification. |
+| `tests/` | `test_streaks.py`, `test_search.py`, `test_playlists.py` — existing test coverage to reference/extend. |
+
+### Data flow: adding a song to a playlist
+
+1. **Request:** `POST /playlists/<playlist_id>/songs` with `{ song_id, added_by }`.
+2. **Route (`routes/playlists.py::add_song`):** validates both fields are present, then calls `add_to_playlist(playlist_id, song_id, added_by)`, which comes from `services.notification_service`, not `services.playlist_service`.
+3. **Service (`notification_service.add_to_playlist`):**
+   - Loads `Song`, `User` (adder), `Playlist` — 404/400 via `ValueError` if any is missing.
+   - If the song isn't already in `playlist.songs`, adds it playlist (`playlist.songs.append(song)`) and commits,which then writes a row into the `playlist_entries` association table.
+   - If the added song isn't the song's original sharer (`song.shared_by`), calls `create_notification(...)` to notify the sharer.
+4. **Read-back (separate request):** `GET /playlists/<playlist_id>/songs` → `routes/playlists.py::get_songs` → `playlist_service.get_playlist_songs`, which queries the **raw `playlist_entries` table** directly (not the ORM relationship), joined to `Song`, ordered by `position` ascending.
+
+**Notable pattern:** the write and read path read from the same association table (`playlist_entries`) through two different access methods — ORM relationship append vs. raw table join/query. The write path never explicitly sets `position`; how that column ends up populated is worth tracing carefully.
+
+### Data flow: a friend's listen appearing in "Friends Listening Now"
+
+1. **Record:** `POST /songs/<song_id>/listen` with `{ user_id }` → `routes/songs.py::listen` → `streak_service.record_listening_event`, which creates a `ListeningEvent(listened_at=now)` and also updates the listener's streak in the same call. 
+2. **View:** `GET /feed/<user_id>/listening-now` → `routes/feed.py::listening_now` → `feed_service.get_friends_listening_now`, which:
+   - Resolves `friend_ids` from `user.friends` (confirmed bidirectional in `seed_data.py`).
+   - Filters `ListeningEvent` to `user_id IN friend_ids AND listened_at >= (now - 24h)`.
+   - Dedupes to one (most recent) event per friend.
+3. The two functions never call each other directly — they're connected only by the shared `ListeningEvent` table and the meaning of `listened_at` on both ends.
+
+### Data flow: a user rates a song
+
+1. **Request:** `POST /songs/<song_id>/rate` with `{ user_id, score }`.
+2. **Route (`routes/songs.py::rate`):** validates both fields are present, casts `score` to `int`, then calls `rate_song(user_id, song_id, score)` that is imported from `services.notification_service`, the same file that holds `add_to_playlist`.
+3. **Service (`notification_service.rate_song`):**
+   - Validates `score` is between 1 and 5.
+   - Loads `Song` and `User` (rater); raises `ValueError` if either is missing.
+   - Looks up an existing `Rating` for this `(user_id, song_id)` pair (enforced unique by `models.py`'s `UniqueConstraint`).
+   - If found, updates its `score` in place; if not, creates a new `Rating` row.
+   - Commits and returns the `Rating`.
+4. **Notification: does not happen.** Unlike the function `add_to_playlist` in the same file, which calls `create_notification(...)` after changing the playlist, `rate_song` never calls `create_notification` anywhere in its body. The `Rating` itself is persisted correctly and readable via other endpoints, but no `Notification` row is ever created as a result of a rating.
+
+**Comparison to the playlist-add flow:** both functions follow the same shape (load entities → mutate/persist → [conditionally] notify), but only `add_to_playlist` completes the third step. This directly explains reported issue #4 ("notified when a friend added my song to a playlist but not when they rated it"). The rating path isn't calling the playlist-add path. See root cause analysis section for full write-up once fixed.
+
+### Patterns observed
+
+- **Domain logic doesn't always live where its route file's name implies.** Playlist mutation (`add_to_playlist`) lives in `notification_service.py`, not `playlist_service.py`.
+- **Inconsistent access to association tables.** Some code goes through ORM relationships (`playlist.songs.append(...)`, `user.friends`), other code queries the raw association table object directly (`playlist_entries`, `song_tags`) with explicit joins.
+- **Per-row hydration instead of joined queries.** `feed_service.py` calls `db.session.get()` individually for each friend/song inside a loop rather than joining `User`/`Song` into the original query.
+- **Song creation has no route.** All `Song` rows in this repo originate from `seed_data.py`; no blueprint exposes a "create/share song" endpoint.
+- **Docstrings vs. code.** In at least one service file reviewed so far, a docstring's stated behavior and the code's actual branching didn't fully match — worth checking this systematically against every function, not just the one already found.

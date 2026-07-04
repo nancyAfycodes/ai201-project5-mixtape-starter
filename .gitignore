@@ -33,3 +33,4 @@ build/
 # debugging file
 debug_repro.py
 debug_repro_issue4.py
+debug_repro_issue5.py

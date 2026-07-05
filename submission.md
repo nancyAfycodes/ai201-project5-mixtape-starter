@@ -70,7 +70,32 @@ The two cases are identical in every respect (same starting streak, same one-day
 
 **Independent confirmation:** the project's own `tests/test_streaks.py` contains `test_streak_increments_on_sunday`, which asserts a Saturday→Sunday listen should increment the streak to 2. Running `pytest tests/test_streaks.py -v` confirms this test currently **fails** (`assert 1 == 2`) while the other 4 streak tests pass — matching my manual reproduction exactly and confirming this is a pre-existing, project-authored expectation, not just my own interpretation of the docstring.
 
-*(Root cause, fix, and side-effect verification to be completed in Milestone 3.)*
+**How I found the root cause:**
+
+The docstring's own "Streak rules" list only specifies four cases: no prior history, already listened today, listened yesterday (increment), more than one day passed (reset). None of these mention any day-of-week exception. Comparing the docstring line-by-line against the code, the `elif` branch responsible for incrementing had an extra, undocumented condition attached to it: `days_since_last == 1 and today.weekday() != 6`. Tracing through a concrete Sat→Sun example showed that when the new listening event falls on a Sunday (`weekday() == 6`), the `!= 6` check evaluates to `False`, so the condition as a whole is `False` even though the listen is genuinely consecutive — sending execution to the `else` branch, which resets the streak to 1.
+
+**The root cause:**
+
+The streak-increment branch in `update_listening_streak()` included an extraneous condition, `today.weekday() != 6`, that isn't part of the documented streak rules. Since Python's `date.weekday()` returns `6` for Sunday, this condition evaluates to `False` specifically when the new listening event occurs on a Sunday — even when the previous listen was exactly one day earlier (a genuinely consecutive day). As a result, any user who listens every single day without ever missing one has their streak silently reset to 1 every time a listening event lands on a Sunday, which matches the reported symptom ("my listening streak keeps resetting") even for users with no actual gaps in their listening habit.
+
+**My fix and side-effect check:**
+
+Removed the extraneous condition, changing:
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+```
+to:
+```python
+elif days_since_last == 1:
+```
+This is the smallest possible change addressing the root cause directly — it doesn't touch any other branch or add new logic, just removes a condition that shouldn't have been there per the function's own documented rules.
+
+**Verification:**
+- Ran `pytest tests/test_streaks.py -v`: all 5 tests pass, including the previously-failing `test_streak_increments_on_sunday`. The other 4 tests (new user starts at 1, consecutive-day increment, same-day no-op, skipped-day reset) still pass unchanged, confirming the fix didn't affect any other branch.
+- Re-ran my original manual reproduction (Sat→Sun, streak 5) in a fresh Python process: streak now correctly increments to 6 instead of resetting to 1.
+- Re-ran my earlier "control" case (Mon→Tue) to confirm normal weekday increments are unaffected: unchanged, still increments correctly.
+
+*(Committed as a separate commit on `bugfix/mixtape`.)*
 
 ### Issue #2: Friends Listening Now shows people from yesterday
 

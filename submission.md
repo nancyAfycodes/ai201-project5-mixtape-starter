@@ -119,7 +119,26 @@ Compared `get_friends_listening_now()` against its sibling function `get_activit
 
 `get_friends_listening_now()` filters events using `RECENT_THRESHOLD = timedelta(hours=24)`. The filter and its underlying SQL comparison work exactly as coded (verified: the compiled cutoff literal matched the stored timestamp format exactly, ruling out a timezone/string-comparison defect). The actual problem is the threshold value itself: 24 hours is too generous for a feature presented to users as "Listening Now." A friend who listened at, e.g., 10pm the previous night will still appear as "currently listening" for the entire next day, which matches the reported symptom ("shows people from yesterday"). This is a threshold/design defect rather than a broken comparison or missing condition.
 
-*(Fix and side-effect verification to be completed in Milestone 3.)*
+**My fix and side-effect check:**
+
+Changed the threshold constant in `feed_service.py`:
+```python
+RECENT_THRESHOLD = timedelta(hours=24)
+```
+to:
+```python
+RECENT_THRESHOLD = timedelta(hours=1, minutes=15)
+```
+
+There's no single objectively "correct" value here since nothing in the codebase specifies an intended window — this required a judgment call rather than a mechanical fix. I chose 1 hour 15 minutes based on: (1) the seed data's own pattern, where "recent" events representing genuine current activity were seeded at 10–20 minutes ago while "older," non-current events start at 2+ hours ago, suggesting the intended boundary sits somewhere in between; and (2) allowing enough headroom for a full podcast episode, which commonly runs past the one-hour mark, so a listener isn't marked "not listening" mid-episode. (Note: the current data model doesn't actually distinguish songs from podcasts — everything is a `Song` — so this is a forward-looking, conservative choice about session length rather than something the existing code differentiates.)
+
+**Verification:**
+- Re-tested the original reproduction case (aaliya, 19 hours old, kenji's only other event-having friend): now correctly **excluded** from the feed.
+- Added a new boundary check: inserted a fresh event ~1 hour old for the same user and confirmed she **is** correctly included — confirming the fix isn't overcorrected into excluding genuinely recent activity.
+- No existing project test file covers this function's threshold specifically, so manual verification on both sides of the new boundary was the primary evidence for this fix.
+- Checked `get_activity_feed()` (the sibling function in the same file) — it doesn't reference `RECENT_THRESHOLD` at all, so this change has no effect on it.
+
+*(Committed as a separate commit on `bugfix/mixtape`.)*
 
 ### Issue #3: The same song keeps showing up twice in search — investigated, not reproducible in this environment
 

@@ -68,6 +68,8 @@ Isolated `update_listening_streak()` in a Flask shell rather than going through 
 
 The two cases are identical in every respect (same starting streak, same one-day gap) except which day of the week the second listen fell on. This isolates the failure to the specific case where the new listening event occurs on a Sunday, ruling out a broader problem with the day-gap/increment logic itself.
 
+**Independent confirmation:** the project's own `tests/test_streaks.py` contains `test_streak_increments_on_sunday`, which asserts a Saturday→Sunday listen should increment the streak to 2. Running `pytest tests/test_streaks.py -v` confirms this test currently **fails** (`assert 1 == 2`) while the other 4 streak tests pass — matching my manual reproduction exactly and confirming this is a pre-existing, project-authored expectation, not just my own interpretation of the docstring.
+
 *(Root cause, fix, and side-effect verification to be completed in Milestone 3.)*
 
 ### Issue #2: Friends Listening Now shows people from yesterday
@@ -91,6 +93,83 @@ Compared `get_friends_listening_now()` against its sibling function `get_activit
 **The root cause:**
 
 `get_friends_listening_now()` filters events using `RECENT_THRESHOLD = timedelta(hours=24)`. The filter and its underlying SQL comparison work exactly as coded (verified: the compiled cutoff literal matched the stored timestamp format exactly, ruling out a timezone/string-comparison defect). The actual problem is the threshold value itself: 24 hours is too generous for a feature presented to users as "Listening Now." A friend who listened at, e.g., 10pm the previous night will still appear as "currently listening" for the entire next day, which matches the reported symptom ("shows people from yesterday"). This is a threshold/design defect rather than a broken comparison or missing condition.
+
+*(Fix and side-effect verification to be completed in Milestone 3.)*
+
+### Issue #3: The same song keeps showing up twice in search — investigated, not reproducible in this environment
+
+**How I attempted to reproduce it:**
+
+`seed_data.py`'s own comments flag multi-tag songs (3+ tags) as the intended trigger for this bug, since `search_songs()` in `search_service.py` performs an `outerjoin` against `song_tags` without any apparent deduplication step. I tested this from multiple angles:
+
+1. Queried `search_songs("Crown Heights")` (a 3-tag song) directly — returned exactly 1 result, not 3.
+2. Queried the same `search_songs()` function across a 0-tag, 1-tag, and three different 3-tag songs individually — all returned exactly 1 result each, with correct tag lists.
+3. Ran a broad query (`search_songs("a")`) matching 13 of the seeded songs and manually counted occurrences of each returned `id` — no duplicates found; 13 rows returned for 13 total `Song` rows in the DB.
+4. Bypassed the ORM entirely and ran the equivalent join as raw SQL directly against the DB:
+   ```sql
+   SELECT song.id, song.title FROM song
+   LEFT OUTER JOIN song_tags ON song.id = song_tags.song_id
+   WHERE song.title LIKE '%Crown Heights%'
+   ```
+   This **did** return 3 identical rows (one per tag) — confirming the join itself produces row fan-out at the SQL level, exactly as the code's structure would suggest.
+5. Ran the project's own test suite (`pytest tests/test_search.py -v`), including `test_search_no_duplicates_multi_tag_song`, whose inline comment states `# Should be 1, bug causes it to be 3`. All 5 tests passed, including this one.
+
+**Conclusion:**
+
+The join does produce duplicate rows at the raw SQL level (step 4), but SQLAlchemy's ORM layer (version 2.0.51, confirmed via `pip show sqlalchemy`) appears to automatically deduplicate repeated primary keys when the query selects full mapped entities (`db.session.query(Song)`), collapsing the 3 joined rows back into a single `Song` object before `search_songs()` ever returns. This most likely means the originally-intended bug relied on different deduplication behavior in an older SQLAlchemy version, and is not observable as a user-facing defect in this environment as currently configured.
+
+Per the Milestone 2 guidance ("If you can't reproduce a bug after a genuine attempt, try a different one from the list"), I moved on to Issue #5 as a third bug to fix, after a genuine, multi-angle reproduction attempt on this one.
+
+### Issue #4: Notified when a friend adds my song to a playlist, but not when they rate it
+
+**How I reproduced it:**
+
+Ran a standalone script (`debug_repro_issue4.py`) that exercises `rate_song()` directly — the same function `POST /songs/<song_id>/rate` calls:
+
+1. Selected a seeded song ("Crown Heights Anthem," shared by user `ea6d7a9f...`) and a different user (`nova`, `a51eefbe...`) as the rater — confirmed the rater is not the song's original sharer.
+2. Counted the sharer's notifications via `get_notifications()` before rating: **0**.
+3. Called `rate_song(rater.id, song.id, 5)` — this succeeded and returned a `Rating` with the correct `score`, `user_id`, and `song_id`.
+4. Counted the sharer's notifications again after rating: **0** — unchanged.
+
+The rating itself is saved correctly and is queryable elsewhere in the app; specifically no `Notification` row is created as a side effect of rating, confirmed by a direct before/after count rather than just reading the code.
+
+**How I found the root cause:**
+
+Traced the call chain from the route down: `routes/songs.py::rate` → `notification_service.rate_song`. Read `rate_song()` line by line and found it only ever loads `Song`/`User`, checks for an existing `Rating`, updates-or-creates it, and commits — no call to `create_notification()` anywhere in the function body. Compared this directly against the sibling function `add_to_playlist()` in the same file, which follows the same overall shape (load entities → mutate/persist → conditionally notify) but does call `create_notification()` as its final step, guarded by a check that the actor isn't the song's original sharer. The moment I confirmed this was the specific cause (not just a "suspicious area") was seeing that `rate_song()` has no equivalent call or guard condition at all — the notification step isn't broken, it's simply absent.
+
+**The root cause:**
+
+`rate_song()` in `notification_service.py` persists the `Rating` correctly but never calls `create_notification()`, unlike its sibling function `add_to_playlist()`, which does call it after mutating the playlist. As a result, a song's original sharer receives a notification when a friend adds their song to a playlist, but receives no notification when a friend rates that same song — even though both are user-facing, friend-triggered interactions with a shared song.
+
+*(Fix and side-effect verification to be completed in Milestone 3.)*
+
+### Issue #5: The last song in a playlist never shows up
+
+**How I reproduced it:**
+
+Ran a standalone script (`debug_repro_issue5.py`) comparing raw `playlist_entries` rows against `get_playlist_songs()`'s output, across all 3 seeded playlists:
+
+| Playlist | Rows in `playlist_entries` | Songs returned by `get_playlist_songs()` | Missing |
+|---|---|---|---|
+| Late Night Vibes | 7 | 6 | Free Throws |
+| Friday Energy | 7 | 6 | Harlem Renaissance |
+| Study Mode | 7 | 6 | Lagos to London |
+
+In every case, exactly one song was missing, and in every case it was the song with the highest `position` value — i.e., the most recently added song in that playlist.
+
+**Independent confirmation:** the project's own `tests/test_playlists.py` contains `test_playlist_returns_all_songs` (asserting `len(songs) == 5`, with an inline comment `# Bug causes this to return 4`) and `test_playlist_returns_songs_in_order` (asserting all 5 seeded titles are returned in order). Running `pytest tests/test_playlists.py -v` confirms both currently **fail**: the first with `assert 4 == 5`, the second showing the returned list is missing exactly `'Track 5'` — the highest-position song. This matches my manual reproduction exactly and confirms the exclusion is unintended (the test's own comment explicitly calls it a "bug"), ruling out the possibility that the missing song is an intentional trailing exclusion.
+
+**How I found the root cause:**
+
+Re-read `get_playlist_songs()` in `playlist_service.py` line by line. The query itself — join `Song` to `playlist_entries`, filter by `playlist_id`, order ascending by `position` — has no limit or filter that would exclude anything; `.all()` returns the full, correctly-ordered list. The very next line is where the count changes:
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+The slice `songs[:-1]` returns everything except the last element of the list. Confirmed this is the exact mechanism by checking: (1) the query result before the slice contains all songs, and (2) since the list is ordered ascending by `position`, the last element is always the most-recently-added song — which matches exactly which song went missing in every reproduction case above.
+
+**The root cause:**
+
+`get_playlist_songs()` correctly queries and orders all songs in a playlist by ascending `position`, but its return statement applies `songs[:-1]` before converting the results to dicts, which unconditionally drops the last element of the list. Because the list is ordered ascending by position, the last element is always the most recently added song — so every playlist is missing exactly one song: whichever one was added last. This is confirmed as unintended by both the function's own docstring ("This function returns all songs in the playlist") and the project's existing test suite, which explicitly labels the resulting count mismatch a bug.
 
 *(Fix and side-effect verification to be completed in Milestone 3.)*
 

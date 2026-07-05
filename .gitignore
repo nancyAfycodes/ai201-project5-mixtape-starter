@@ -34,3 +34,4 @@ build/
 debug_repro.py
 debug_repro_issue4.py
 debug_repro_issue5.py
+debug_verify_issue2.py

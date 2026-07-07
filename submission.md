@@ -214,6 +214,8 @@ Also confirmed `add_to_playlist()` (the sibling function in the same file) was n
 
 *(Committed as a separate commit on `bugfix/mixtape`.)*
 
+**Regression test:** Added `tests/test_notifications.py`, a new test file (Issue #4 previously had no test coverage at all) covering three scenarios: a friend's rating notifies the sharer, a self-rating does not, and updating an existing rating does not create a second notification. Confirmed this is a genuine regression test by temporarily disabling the notification block in `rate_song()` and re-running the suite: 2 of the 3 tests failed (`test_rating_a_friends_song_notifies_the_sharer` and `test_updating_an_existing_rating_does_not_notify_again`, the latter failing at its setup step since it also depends on the first rating notifying correctly). Restored the fix afterward and confirmed all 3 tests pass again.
+
 ### Issue #5: The last song in a playlist never shows up
 
 **How I reproduced it:**
@@ -261,7 +263,7 @@ This is the smallest possible change addressing the root cause directly: the que
 
 *(Committed as a separate commit on `bugfix/mixtape`.)*
 
-**Regression test:** Added `tests/test_notifications.py`, a new test file (Issue #4 previously had no test coverage at all) covering three scenarios: a friend's rating notifies the sharer, a self-rating does not, and updating an existing rating does not create a second notification. Confirmed this is a genuine regression test by temporarily disabling the notification block in `rate_song()` and re-running the suite: 2 of the 3 tests failed (`test_rating_a_friends_song_notifies_the_sharer` and `test_updating_an_existing_rating_does_not_notify_again`, the latter failing at its setup step since it also depends on the first rating notifying correctly). Restored the fix afterward and confirmed all 3 tests pass again.
+### Patterns observed
 
 - **Domain logic doesn't always live where its route file's name implies.** Playlist mutation (`add_to_playlist`) lives in `notification_service.py`, not `playlist_service.py`.
 - **Inconsistent access to association tables.** Some code goes through ORM relationships (`playlist.songs.append(...)`, `user.friends`), other code queries the raw association table object directly (`playlist_entries`, `song_tags`) with explicit joins.

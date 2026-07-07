@@ -104,6 +104,7 @@ def rate_song(user_id: str, song_id: str, score: int) -> Rating:
         )
 
     return rating
+
 def get_notifications(user_id: str, unread_only: bool = False) -> list[dict]:
     """
     Retrieve notifications for a user.

@@ -185,7 +185,34 @@ Traced the call chain from the route down: `routes/songs.py::rate` → `notifica
 
 `rate_song()` in `notification_service.py` persists the `Rating` correctly but never calls `create_notification()`, unlike its sibling function `add_to_playlist()`, which does call it after mutating the playlist. As a result, a song's original sharer receives a notification when a friend adds their song to a playlist, but receives no notification when a friend rates that same song — even though both are user-facing, friend-triggered interactions with a shared song.
 
-*(Fix and side-effect verification to be completed in Milestone 3.)*
+**My fix and side-effect check:**
+
+Added a `create_notification()` call to `rate_song()`, guarded by two conditions decided deliberately rather than left as an oversight:
+
+1. **Only on the first rating, not on updates.** Captured `is_new_rating = existing is None` before the existing create-or-update logic runs. Without this, a user changing their rating multiple times would spam the sharer with repeated notifications for the same underlying interaction.
+2. **Not when rating your own song.** Mirrored the same guard `add_to_playlist()` already uses (`song.shared_by != user_id`), for consistency between the two notification-triggering actions.
+
+```python
+is_new_rating = existing is None
+# ...(existing create-or-update logic unchanged)...
+if is_new_rating and song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score} stars.",
+    )
+```
+
+**Verification:**
+
+No existing project test file covers this function's notification behavior, so I wrote a standalone verification script (`debug_repro_issue4.py`) covering three scenarios:
+- **First-time rating by a different user:** notification count went 0 → 1 (correct).
+- **Self-rating (user rates their own song):** notification count unchanged (correct — guard works).
+- **First rating, then an update to that same rating:** count went 0 → 1 → 1 (correct — notifies once, not on the update).
+
+Also confirmed `add_to_playlist()` (the sibling function in the same file) was not modified and continues to behave independently — this fix only touches `rate_song()`.
+
+*(Committed as a separate commit on `bugfix/mixtape`.)*
 
 ### Issue #5: The last song in a playlist never shows up
 

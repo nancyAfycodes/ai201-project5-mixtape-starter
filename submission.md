@@ -70,6 +70,12 @@ In conclusion, AI was most useful for explaining code I'd already read myself, t
 
 **Comparison to the playlist-add flow:** both functions follow the same shape (load entities → mutate/persist → [conditionally] notify), but only `add_to_playlist` completes the third step. This directly explains reported issue #4 ("notified when a friend added my song to a playlist but not when they rated it") — the rating path is simply missing the call that the playlist-add path has. See root cause analysis section for full write-up once fixed.
 
+## Commit History
+
+![git log showing one commit per bug fix](./screenshots/git-log.png)
+![git log showing one commit per bug fix](./screenshots/git-log1.png)
+
+
 ## Root Cause Analysis
 
 ### Issue #1: My listening streak keeps resetting

@@ -215,7 +215,24 @@ The slice `songs[:-1]` returns everything except the last element of the list. C
 
 `get_playlist_songs()` correctly queries and orders all songs in a playlist by ascending `position`, but its return statement applies `songs[:-1]` before converting the results to dicts, which unconditionally drops the last element of the list. Because the list is ordered ascending by position, the last element is always the most recently added song — so every playlist is missing exactly one song: whichever one was added last. This is confirmed as unintended by both the function's own docstring ("This function returns all songs in the playlist") and the project's existing test suite, which explicitly labels the resulting count mismatch a bug.
 
-*(Fix and side-effect verification to be completed in Milestone 3.)*
+**My fix and side-effect check:**
+
+Removed the slice entirely, changing:
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+to:
+```python
+return [song.to_dict() for song in songs]
+```
+This is the smallest possible change addressing the root cause directly: the query already produces the correct, fully-ordered list of songs, so no slicing was needed at all. No other logic in the function required changes.
+
+**Verification:**
+- Ran `pytest tests/test_playlists.py -v`: all 3 tests pass, including the two previously-failing tests (`test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`). `test_empty_playlist_returns_empty_list` continues to pass unchanged, confirming the fix doesn't break the empty-playlist edge case.
+- Re-ran my manual reproduction script (`debug_repro_issue5.py`) against the full seeded dataset: all three seeded playlists (Late Night Vibes, Friday Energy, Study Mode) now correctly return all 7 songs each, matching the raw `playlist_entries` row count exactly, with nothing missing.
+- Checked `get_playlist()` and `get_user_playlists()` (the other two functions in the same file) — neither touches `songs` or the slice, so this change has no effect on them.
+
+*(Committed as a separate commit on `bugfix/mixtape`.)*
 
 ### Patterns observed
 

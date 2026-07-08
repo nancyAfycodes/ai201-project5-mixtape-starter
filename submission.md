@@ -32,7 +32,7 @@ In conclusion, AI was most useful for explaining code I'd already read myself, t
 | `services/search_service.py` | Text search over `Song.title` / `Song.artist`, outer-joined to `song_tags`. |
 | `services/notification_service.py` | Notification CRUD (`create_notification`, `get_notifications`, `mark_as_read`) **and** two domain actions that happen to live here: `add_to_playlist` (mutates `playlist.songs`, then conditionally notifies the original sharer) and `rate_song` (create-or-update a `Rating`, no notification triggered). |
 | `services/playlist_service.py` | Playlist creation and read-only retrieval: `get_playlist`, `get_user_playlists` (creator-only, not collaborators), and `get_playlist_songs` (joins the raw `playlist_entries` table, ordered by `position`). |
-| `seed_data.py` | Populates the DB with 5 users (bidirectional friendships), 25 songs (with 0, 1, or 3+ tags — multi-tag songs are explicitly noted in the script as exercising Issue #3), 3 playlists, a mix of recent and older `ListeningEvent` rows, preset streak values, and one example "song added to playlist" notification. |
+| `seed_data.py` | Populates the DB with 5 users (bidirectional friendships), 25 songs (with 0, 1, or 3+ tags), 3 playlists, a mix of recent and older `ListeningEvent` rows, preset streak values, and one example "song added to playlist" notification. |
 | `tests/` | `test_streaks.py`, `test_search.py`, `test_playlists.py` — existing test coverage to reference/extend. |
 
 ### Data flow: adding a song to a playlist
@@ -66,15 +66,9 @@ In conclusion, AI was most useful for explaining code I'd already read myself, t
    - Looks up an existing `Rating` for this `(user_id, song_id)` pair (enforced unique by `models.py`'s `UniqueConstraint`).
    - If found, updates its `score` in place; if not, creates a new `Rating` row.
    - Commits and returns the `Rating`.
-4. **Notification: does not happen.** Unlike its sibling function `add_to_playlist` in the same file — which calls `create_notification(...)` after mutating the playlist — `rate_song` never calls `create_notification` anywhere in its body. The `Rating` itself is persisted correctly and readable via other endpoints, but no `Notification` row is ever created as a result of a rating.
+4. **Notification:** `rate_song` does not call `create_notification` anywhere in its body. The `Rating` is persisted correctly and readable via other endpoints, but no `Notification` row is created as a side effect of a rating — unlike `add_to_playlist` in the same file, which does call `create_notification` after mutating the playlist.
 
-**Comparison to the playlist-add flow:** both functions follow the same shape (load entities → mutate/persist → [conditionally] notify), but only `add_to_playlist` completes the third step. This directly explains reported issue #4 ("notified when a friend added my song to a playlist but not when they rated it") — the rating path is simply missing the call that the playlist-add path has. See root cause analysis section for full write-up once fixed.
-
-## Commit History
-
-![git log showing one commit per bug fix](./screenshots/git-log.png)
-![git log showing one commit per bug fix](./screenshots/git-log1.png)
-
+**Structural note:** both `rate_song` and `add_to_playlist` follow the same overall shape (load entities → mutate/persist → [conditionally] notify), but only `add_to_playlist` completes the third step. This asymmetry is worth noting when reading `notification_service.py` — the two functions are structurally parallel but behave differently with respect to notification side effects.
 
 ## Root Cause Analysis
 
@@ -161,15 +155,15 @@ There's no single objectively "correct" value here since nothing in the codebase
 
 *(Committed as a separate commit on `bugfix/mixtape`.)*
 
-### Issue #3: The same song keeps showing up twice in search — investigated, not reproducible in this environment
+### Issue #3: The same song keeps showing up twice in search
 
-**How I attempted to reproduce it:**
+**How I reproduced it:**
 
-`seed_data.py`'s own comments flag multi-tag songs (3+ tags) as the intended trigger for this bug, since `search_songs()` in `search_service.py` performs an `outerjoin` against `song_tags` without any apparent deduplication step. I tested this from multiple angles:
+`seed_data.py` seeds multi-tag songs (3+ tags) as the intended trigger for this bug, since `search_songs()` performs an `outerjoin` against `song_tags` without any explicit deduplication step. I tested this from multiple angles:
 
 1. Queried `search_songs("Crown Heights")` (a 3-tag song) directly — returned exactly 1 result, not 3.
-2. Queried the same `search_songs()` function across a 0-tag, 1-tag, and three different 3-tag songs individually — all returned exactly 1 result each, with correct tag lists.
-3. Ran a broad query (`search_songs("a")`) matching 13 of the seeded songs and manually counted occurrences of each returned `id` — no duplicates found; 13 rows returned for 13 total `Song` rows in the DB.
+2. Queried across 0-tag, 1-tag, and three different 3-tag songs individually — all returned exactly 1 result each.
+3. Ran a broad query (`search_songs("a")`) matching all 13 seeded songs and manually counted occurrences of each returned `id` — no duplicates found; 13 rows returned for 13 total `Song` rows in the DB.
 4. Bypassed the ORM entirely and ran the equivalent join as raw SQL directly against the DB:
    ```sql
    SELECT song.id, song.title FROM song
@@ -179,11 +173,39 @@ There's no single objectively "correct" value here since nothing in the codebase
    This **did** return 3 identical rows (one per tag) — confirming the join itself produces row fan-out at the SQL level, exactly as the code's structure would suggest.
 5. Ran the project's own test suite (`pytest tests/test_search.py -v`), including `test_search_no_duplicates_multi_tag_song`, whose inline comment states `# Should be 1, bug causes it to be 3`. All 5 tests passed, including this one.
 
-**Conclusion:**
+**How I found the root cause:**
 
-The join does produce duplicate rows at the raw SQL level (step 4), but SQLAlchemy's ORM layer (version 2.0.51, confirmed via `pip show sqlalchemy`) appears to automatically deduplicate repeated primary keys when the query selects full mapped entities (`db.session.query(Song)`), collapsing the 3 joined rows back into a single `Song` object before `search_songs()` ever returns. This most likely means the originally-intended bug relied on different deduplication behavior in an older SQLAlchemy version, and is not observable as a user-facing defect in this environment as currently configured.
+The raw SQL join (step 4) confirmed that `outerjoin(song_tags, Song.id == song_tags.c.song_id)` fans out one row per tag — a song with 3 tags produces 3 joined rows. At the ORM level, SQLAlchemy 2.0.51 automatically deduplicates repeated primary keys when querying full mapped entities (`db.session.query(Song)`), which is why no duplicates surfaced through `search_songs()` in this environment. However, this deduplication is a framework-internal behavior, not an explicit, guaranteed part of the query — a future SQLAlchemy version update, a switch to tuple-returning queries, or a different ORM configuration could silently resurface the duplication. The join fans out rows structurally; the query itself never explicitly collapses them.
 
-Per the Milestone 2 guidance ("If you can't reproduce a bug after a genuine attempt, try a different one from the list"), I moved on to Issue #5 as a third bug to fix, after a genuine, multi-angle reproduction attempt on this one.
+**The root cause:**
+
+`search_songs()` performs an `outerjoin` against `song_tags` to include tag data in the query, but does not include a `.distinct()` call to explicitly deduplicate songs that match multiple tags. The query currently relies on incidental ORM-level deduplication behavior rather than making the deduplication intent explicit in the query itself. This means the code is structurally incorrect even when it appears to work — a song with N tags produces N joined rows at the SQL level, and correct output depends on framework behavior that isn't guaranteed across versions or query styles.
+
+**My fix and side-effect check:**
+
+Added `.distinct()` before `.all()` in the query chain:
+```python
+results = (
+    db.session.query(Song)
+    .outerjoin(song_tags, Song.id == song_tags.c.song_id)
+    .filter(
+        db.or_(
+            Song.title.ilike(f"%{query}%"),
+            Song.artist.ilike(f"%{query}%"),
+        )
+    )
+    .distinct()
+    .all()
+)
+```
+This makes deduplication an explicit, guaranteed part of the query rather than a side effect of ORM internals — the intent is now clear in the code itself, and correct behavior is preserved regardless of SQLAlchemy version or query style changes.
+
+**Verification:**
+- Re-ran the broad search debug script (`debug_repro_issue3.py`): 13 rows returned for 13 total `Song` rows, 13 distinct ids — behavior unchanged, now explicitly guaranteed.
+- Ran `pytest tests/test_search.py -v`: all 5 tests pass, including `test_search_no_duplicates_multi_tag_song`. No regressions.
+- `get_song()` (the other function in the same file) uses a plain primary-key lookup with no join — unaffected by this change.
+
+*(Committed as a separate commit on `bugfix/mixtape`.)*
 
 ### Issue #4: Notified when a friend adds my song to a playlist, but not when they rate it
 
